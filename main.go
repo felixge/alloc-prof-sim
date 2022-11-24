@@ -13,10 +13,15 @@ import (
 
 func main() {
 	cmd := Cmd{}
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "usage: alloc-prof-sim [flags]\n")
+		flag.PrintDefaults()
+	}
+	flag.BoolVar(&cmd.Errors, "errors", false, "Report errors relative to perfect profiler instead of absolute numbers.")
 	flag.BoolVar(&cmd.Scale, "scale", true, "Scale sampled values to represent estimates of the true allocations.")
-	flag.IntVar(&cmd.Exp, "exp", 8, "Repeat workload 10^exp times.")
-	flag.Int64Var(&cmd.Seed, "seed", time.Now().UnixNano(), "Seed for randomn number generator.")
-	flag.BoolVar(&cmd.Errors, "errors", false, "Report errors relative to perfect profiler.")
+	flag.Int64Var(&cmd.Seed, "seed", time.Now().UnixNano(), "Seed for random number generator.")
+	flag.IntVar(&cmd.Exp, "exp", 8, "Repeat each workload 10^exp times.")
+	flag.IntVar(&cmd.Rate, "rate", 100*1024, "Sampling rate in bytes.")
 	flag.Parse()
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
@@ -29,12 +34,12 @@ type Cmd struct {
 	Exp    int
 	Seed   int64
 	Errors bool
+	Rate   int
 }
 
 func (c *Cmd) Run() error {
 	var (
 		newRand = func() *rand.Rand { return rand.New(rand.NewSource(c.Seed)) }
-		rate    = 100 * 1024
 		small   = 16
 		big     = 128
 	)
@@ -42,21 +47,20 @@ func (c *Cmd) Run() error {
 	var (
 		profilers = []func(scale bool) Profiler{
 			func(scale bool) Profiler { return &PerfectProfiler{} },
-			func(scale bool) Profiler { return &DotNetProfiler{Scale: scale, Rate: rate} },
-			// func(scale bool) Profiler { return &GoProfiler{Scale: scale, Rand: newRand(), Rate: rate} },
+			func(scale bool) Profiler { return &DotNetProfiler{Scale: scale, Rate: c.Rate} },
+			func(scale bool) Profiler { return &GoProfiler{Scale: scale, Rand: newRand(), Rate: c.Rate} },
 		}
 		workloads = []func() Workload{
 			func() Workload { return SequentialWorkload{Small: small, Big: big} },
 			func() Workload { return InterleaveWorkload{Small: small, Big: big} },
 			func() Workload { return InterleaveWorkload{Small: small, Big: big, Rand: newRand()} },
-			func() Workload { return SequentialWorkload{Small: small, Big: rate * 2} },
-			func() Workload { return InterleaveWorkload{Small: small, Big: rate * 2} },
-			func() Workload { return InterleaveWorkload{Small: small, Big: rate * 2, Rand: newRand()} },
+			func() Workload { return SequentialWorkload{Small: small, Big: c.Rate * 2} },
+			func() Workload { return InterleaveWorkload{Small: small, Big: c.Rate * 2} },
+			func() Workload { return InterleaveWorkload{Small: small, Big: c.Rate * 2, Rand: newRand()} },
 		}
 	)
 
-	var results []Result
-	var resultIdx = ResultIndex{}
+	results := NewResults()
 	ops := int64(math.Pow10(c.Exp))
 	for _, newProfiler := range profilers {
 		for _, newWorkload := range workloads {
@@ -65,8 +69,8 @@ func (c *Cmd) Run() error {
 			workload.Work(ops, profiler)
 			profile := profiler.Profile()
 			key := ResultKey{Workload: workload.Name(), Profiler: profiler.Name()}
-			resultIdx[key] = profile
-			results = append(results, Result{ResultKey: key, Profile: profile})
+			results.Index[key] = profile
+			results.List = append(results.List, Result{ResultKey: key, Profile: profile})
 		}
 	}
 
@@ -75,24 +79,19 @@ func (c *Cmd) Run() error {
 
 	cw.Write([]string{"profiler", "workload", "stack", "objects", "bytes"})
 
-	perfect := results[0].Profiler
-	for _, r := range results {
+	perfect := results.List[0].Profiler
+	for _, r := range results.List {
 		if c.Errors && r.Profiler == perfect {
 			continue
 		}
 
-		sortedStacks := []string{}
-		for st := range r.Profile {
-			sortedStacks = append(sortedStacks, string(st))
-		}
-		sort.Strings(sortedStacks)
+		sortedStacks := results.UniqueStacks(r.Workload)
 
 		for _, st := range sortedStacks {
-			st := StackTrace(st)
 			objects := fmt.Sprintf("%d", r.Profile[st].Objects)
 			bytes := fmt.Sprintf("%d", r.Profile[st].Bytes)
 			if c.Errors {
-				perfectResult := resultIdx[ResultKey{Workload: r.Workload, Profiler: perfect}][st]
+				perfectResult := results.Index[ResultKey{Workload: r.Workload, Profiler: perfect}][st]
 				objects = errorPercent(float64(r.Profile[st].Objects), float64(perfectResult.Objects))
 				bytes = errorPercent(float64(r.Profile[st].Bytes), float64(perfectResult.Bytes))
 			}
@@ -108,6 +107,10 @@ func (c *Cmd) Run() error {
 	}
 
 	return nil
+}
+
+func (c *Cmd) run() {
+
 }
 
 type Profiler interface {
@@ -156,6 +159,9 @@ func (p *DotNetProfiler) Profile() Profile {
 	for st, v := range scaled {
 		avgSize := float64(v.Bytes) / float64(v.Objects)
 		scale := 1 / (float64(avgSize) / float64(p.Rate))
+		if int(avgSize) > p.Rate {
+			scale = 1
+		}
 
 		scaled[st] = Alloc{
 			Objects: int64(float64(v.Objects) * scale),
@@ -250,7 +256,7 @@ func (w InterleaveWorkload) Name() string {
 	if w.Rand != nil {
 		rand = "-rand"
 	}
-	return fmt.Sprintf("interlave%s-%d-%d", rand, w.Small, w.Big)
+	return fmt.Sprintf("interleave%s-%d-%d", rand, w.Small, w.Big)
 }
 
 func (w InterleaveWorkload) Work(ops int64, p Profiler) {
@@ -282,6 +288,34 @@ func (w SequentialWorkload) Work(ops int64, p Profiler) {
 	}
 }
 
+func NewResults() Results {
+	return Results{Index: make(map[ResultKey]Profile)}
+}
+
+type Results struct {
+	List  []Result
+	Index map[ResultKey]Profile
+}
+
+func (r Results) UniqueStacks(workload string) []StackTrace {
+	stacks := []StackTrace{}
+	seen := map[StackTrace]bool{}
+	for key, p := range r.Index {
+		if key.Workload != workload {
+			continue
+		}
+		for st := range p {
+			if seen[st] {
+				continue
+			}
+			stacks = append(stacks, st)
+			seen[st] = true
+		}
+	}
+	sort.Slice(stacks, func(i, j int) bool { return stacks[i] < stacks[j] })
+	return stacks
+}
+
 type Result struct {
 	ResultKey
 	Profile Profile
@@ -291,8 +325,6 @@ type ResultKey struct {
 	Workload string
 	Profiler string
 }
-
-type ResultIndex map[ResultKey]Profile
 
 func errorPercent(got, want float64) string {
 	return fmt.Sprintf("%.2f%%", (got-want)/want*100)
